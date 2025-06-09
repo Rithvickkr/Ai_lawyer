@@ -74,19 +74,21 @@ async def run_legal_query(query: str, jurisdiction: str, contract: str, file):
         - 'statute': Fetch a statute for a jurisdiction and topic.
         - 'contract': Analyze a contract.
         - 'document': Generate a legal document.
+        - 'general': Provide general legal information.
+        - 'guide': Provide a legal guide or overview.
         If unclear, default to 'statute'. Extract the topic from the query or use 'general'.
         Query: "{query}"
         Jurisdiction: "{jurisdiction}"
-        Contract: "{contract_text[:100]}"  # Truncate for prompt
+        Contract: "{contract_text[:500]}"  # Truncate for prompt
         Output a JSON object with 'intent' and 'topic', ensuring property names are double-quoted.
         Example: {{"intent": "statute", "topic": "contract"}}
         Return only the JSON object, no extra text or formatting.
         """
-        llm_response = await call_nebius(prompt, max_tokens=2000)
+        llm_response = await call_nebius(prompt, max_tokens=5000)
         logger.debug(f"LLM response: {llm_response}")
 
         # Parse JSON with robust fallback
-        intent_data = {"intent": "statute", "topic": "general"}
+        intent_data = {"intent": "statute", "topic": "general",}
         try:
             # Clean response by removing code blocks, prefixes, and extra whitespace
             cleaned_response = llm_response.strip()
@@ -124,20 +126,88 @@ async def run_legal_query(query: str, jurisdiction: str, contract: str, file):
         intent = intent_data.get("intent", "statute")
         topic = intent_data.get("topic", "general")
 
-        async with aiohttp.ClientSession() as session:
-            if intent == "statute":
-                async with session.get(f"http://127.0.0.1:7860/fetch_statute?jurisdiction={jurisdiction}&topic={topic}") as resp:
-                    result = (await resp.json()).get("result", "Error fetching statute")
-            elif intent == "contract":
-                async with session.post("http://127.0.0.1:7860/analyze_contract", json={"contract_text": contract_text}) as resp:
-                    analysis = await resp.json()
-                    result = f"Clauses: {analysis.get('key_clauses', [])}; Risks: {analysis.get('risks', [])}"
-            else:
-                details = {"query": query, "jurisdiction": jurisdiction, "contract": contract_text}
-                async with session.post("http://127.0.0.1:7860/generate_document", json={"document_type": "Legal Opinion", "details": details}) as resp:
-                    result = (await resp.json()).get("result", "Error generating document")
-            logger.info(f"Final result: {result[:200]}...")  # Log first 200 chars of result
-            return result
+        # Generate response directly using Nebius AI instead of local endpoints
+        if intent == "statute":
+            final_prompt = f"""You are a legal expert. Provide information about {topic} laws in {jurisdiction}. 
+            Include relevant statutes, key provisions, and practical implications. 
+            Be comprehensive but concise. Format your response clearly with headings and bullet points where appropriate.
+            
+            Query: {query}
+            Jurisdiction: {jurisdiction}
+            Topic: {topic}"""
+        elif intent == "contract":
+            final_prompt = f"""You are a contract law expert. Analyze the following contract text and provide:
+            1. Key clauses and their implications
+            2. Potential risks and red flags
+            3. Recommendations for improvements
+            4. Compliance considerations
+            
+            Contract text: {contract_text[:3000]}
+            
+            Provide a detailed analysis with clear sections."""
+        elif intent == "guide":
+            final_prompt = f"""You are a legal guide expert. Based on the following query, guide the user through the legal topic:
+            Query: {query}
+            Jurisdiction: {jurisdiction}
+            Context: {contract_text[:1000] if contract_text else 'No additional context provided'}
+            Provide a structured guide with key points, relevant laws, and practical advice."""
+        else:  # document generation
+            final_prompt = f"""You are a legal document expert. Based on the following query, generate a comprehensive legal opinion or document:
+            
+            Query: {query}
+            Jurisdiction: {jurisdiction}
+            Context: {contract_text[:1000] if contract_text else 'No additional context provided'}
+            
+            Provide a well-structured legal document with appropriate sections, legal reasoning, and citations where relevant."""
+        
+        result = await call_nebius(final_prompt, max_tokens=3000)
+        if not result:
+            result = "I apologize, but I'm unable to process your request at this time. Please try again later or rephrase your query."
+        
+        logger.info(f"Final result: {result[:200]}...")  # Log first 200 chars of result
+        def format_response_markdown(text: str) -> str:
+            """Format the response text with clean, readable structure."""
+            if not text or text.strip() == "":
+                return "No relevant information found. Please try a different query or check the input text."
+            
+            # Clean up the text
+            text = text.strip()
+            
+            # Remove excessive whitespace and normalize line endings
+            text = re.sub(r'\r\n|\r', '\n', text)
+            text = re.sub(r'[ \t]+', ' ', text)
+            text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+            
+            # Remove any existing markdown/HTML formatting that might be malformed
+            text = re.sub(r'<[^>]+>', '', text)
+            text = re.sub(r'\*{2,}', '', text)
+            
+            # Format headers (lines that end with colon or are followed by content)
+            text = re.sub(r'\n([A-Z][A-Za-z\s]{3,}):?\n(?=[A-Za-z])', r'\n\n**\1**\n', text)
+            
+            # Format numbered sections
+            text = re.sub(r'\n(\d+\.\s+[A-Z][^:\n]*):?\n', r'\n\n**\1**\n', text)
+            
+            # Format bullet points consistently
+            text = re.sub(r'\n\s*[-•*]\s*', r'\n• ', text)
+            
+            # Format sub-bullets with proper indentation
+            text = re.sub(r'\n\s+[-•*]\s*', r'\n  - ', text)
+            
+            # Clean up any double formatting
+            text = re.sub(r'\*\*\*+([^*]+)\*\*\*+', r'**\1**', text)
+            
+            # Ensure proper spacing around headers
+            text = re.sub(r'\n\*\*([^*]+)\*\*\n(?=[A-Za-z])', r'\n\n**\1**\n\n', text)
+            
+            # Clean up final formatting
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            
+            return text.strip()
+
+        # Format the result before returning
+        result = format_response_markdown(result)
+        return result + "\n\n*Disclaimer: For informational purposes only, not legal advice.*"
         
     except Exception as e:
         logger.error(f"Error: {str(e)}")
@@ -146,171 +216,242 @@ async def run_legal_query(query: str, jurisdiction: str, contract: str, file):
 def main():
     custom_css = """
     :root {
-        --primary-color: #3b82f6;
-        --secondary-color: #1e40af;
-        --accent-color: #10b981;
-        --warning-color: #f59e0b;
-        --danger-color: #ef4444;
-        --dark-bg: #0f172a;
-        --darker-bg: #020617;
-        --card-bg: #1e293b;
-        --border-color: #334155;
-        --text-primary: #f1f5f9;
-        --text-secondary: #cbd5e1;
-        --input-bg: #334155;
-        --hover-bg: #475569;
+        --primary-bg-start: #1E1F2B;
+        --primary-bg-end: #20212E;
+        --card-bg: #2B2C3B;
+        --primary-accent-start: #1E90FF;
+        --primary-accent-end: #4F9CFF;
+        --text-color: #E0E0E0;
+        --cta-color: #00C781;
+        --warning-color: #FFA500;
+        --border-color: #3A3B4C;
+        --hover-bg: #353648;
+        --input-bg: #252636;
+        --shadow-color: rgba(0, 0, 0, 0.25);
+        --highlight-color: #A78BFA;
     }
     
     .gradio-container {
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        background: linear-gradient(135deg, var(--primary-bg-start) 0%, var(--primary-bg-end) 100%);
         min-height: 100vh;
-        color: var(--text-primary);
+        color: var(--text-color);
+        font-family: 'Inter', 'Roboto', -apple-system, BlinkMacSystemFont, sans-serif;
     }
     
     .main-container {
         max-width: 1400px;
         margin: 0 auto;
-        padding: 20px;
+        padding: 24px;
         background: var(--card-bg);
-        border-radius: 20px;
-        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-        margin-top: 20px;
-        margin-bottom: 20px;
+        border-radius: 16px;
+        box-shadow: 0 20px 40px var(--shadow-color);
+        margin-top: 24px;
+        margin-bottom: 24px;
         border: 1px solid var(--border-color);
     }
     
     .title-header {
-        background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+        background: linear-gradient(135deg, var(--primary-accent-start) 0%, var(--primary-accent-end) 100%);
         color: white;
-        padding: 30px;
-        border-radius: 15px;
-        margin-bottom: 30px;
+        padding: 32px;
+        border-radius: 12px;
+        margin-bottom: 32px;
         text-align: center;
-        box-shadow: 0 10px 25px rgba(59, 130, 246, 0.3);
+        box-shadow: 0 12px 28px rgba(30, 144, 255, 0.3);
+        font-weight: 700;
+        font-size: 24px;
     }
     
     .input-section {
-        background: var(--dark-bg);
-        padding: 25px;
-        border-radius: 15px;
-        border: 2px solid var(--border-color);
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+        background: var(--card-bg);
+        padding: 24px;
+        border-radius: 12px;
+        border: 1px solid var(--border-color);
+        margin-bottom: 24px;
+        box-shadow: 0 4px 12px var(--shadow-color);
+    }
+    
+    .input-section h3 {
+        color: var(--text-color);
+        font-weight: 600;
+        font-size: 16px;
+        margin-bottom: 16px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
     }
     
     .response-box {
         max-height: 500px;
         overflow-y: auto;
-        border: 2px solid var(--accent-color);
-        border-radius: 15px;
+        border: 2px solid var(--cta-color);
+        border-radius: 12px;
         padding: 20px;
         background: var(--input-bg);
-        box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        color: var(--text-primary);
+        box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.2);
+        font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        color: var(--text-color);
+        font-size: 14px;
+        line-height: 1.6;
     }
     
     .footer-disclaimer {
-        background: linear-gradient(135deg, var(--warning-color) 0%, #f97316 100%);
+        background: linear-gradient(135deg, var(--warning-color) 0%, #FF8C00 100%);
         color: white;
         text-align: center;
-        margin-top: 30px;
-        padding: 20px;
-        border-radius: 15px;
-        box-shadow: 0 8px 20px rgba(245, 158, 11, 0.3);
+        margin-top: 32px;
+        padding: 24px;
+        border-radius: 12px;
+        box-shadow: 0 8px 20px rgba(255, 165, 0, 0.3);
         font-weight: 500;
+        font-size: 14px;
     }
     
     .tab-nav {
         background: var(--input-bg);
-        border-radius: 10px;
-        padding: 5px;
+        border-radius: 8px;
+        padding: 8px;
         border: 1px solid var(--border-color);
     }
     
     .examples-section {
-        background: var(--dark-bg);
-        border: 2px solid var(--border-color);
-        border-radius: 15px;
+        background: var(--card-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
         padding: 20px;
-        margin-top: 15px;
-        color: var(--text-primary);
+        margin-top: 16px;
+        color: var(--text-color);
+        box-shadow: 0 4px 12px var(--shadow-color);
     }
     
     /* Button Styling */
     .primary-button {
-        background: linear-gradient(135deg, var(--accent-color) 0%, #059669 100%);
+        background: linear-gradient(135deg, var(--cta-color) 0%, #00A86B 100%);
         border: none;
         color: white;
-        padding: 12px 30px;
+        padding: 14px 32px;
         border-radius: 10px;
-        font-weight: 600;
-        box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4);
+        font-weight: 700;
+        font-size: 14px;
+        box-shadow: 0 6px 18px rgba(0, 199, 129, 0.4);
         transition: all 0.3s ease;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
     }
     
     .primary-button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 8px 25px rgba(16, 185, 129, 0.5);
+        box-shadow: 0 8px 25px rgba(0, 199, 129, 0.5);
+        filter: brightness(110%);
     }
     
     .secondary-button {
         background: linear-gradient(135deg, var(--border-color) 0%, var(--hover-bg) 100%);
         border: none;
-        color: var(--text-primary);
-        padding: 12px 30px;
+        color: var(--text-color);
+        padding: 14px 32px;
         border-radius: 10px;
         font-weight: 600;
-        box-shadow: 0 4px 15px rgba(51, 65, 85, 0.3);
+        font-size: 14px;
+        box-shadow: 0 4px 12px rgba(58, 59, 76, 0.3);
+        transition: all 0.3s ease;
     }
     
     .secondary-button:hover {
         background: linear-gradient(135deg, var(--hover-bg) 0%, var(--border-color) 100%);
+        filter: brightness(110%);
     }
     
     /* Input Styling */
     .gradio-textbox {
         background: var(--input-bg);
         border: 2px solid var(--border-color);
-        border-radius: 10px;
-        padding: 15px;
-        transition: border-color 0.3s ease;
-        color: var(--text-primary);
+        border-radius: 8px;
+        padding: 16px;
+        transition: all 0.3s ease;
+        color: var(--text-color);
+        font-size: 14px;
+        font-weight: 400;
     }
     
     .gradio-textbox:focus {
-        border-color: var(--primary-color);
-        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+        border-color: var(--primary-accent-start);
+        box-shadow: 0 0 0 3px rgba(30, 144, 255, 0.2);
+        outline: none;
     }
     
     /* File Upload Styling */
     .file-upload {
         border: 2px dashed var(--border-color);
-        border-radius: 15px;
-        padding: 30px;
+        border-radius: 12px;
+        padding: 32px;
         background: var(--input-bg);
         text-align: center;
         transition: all 0.3s ease;
-        color: var(--text-primary);
+        color: var(--text-color);
     }
     
     .file-upload:hover {
-        border-color: var(--primary-color);
+        border-color: var(--primary-accent-start);
         background: var(--hover-bg);
+        box-shadow: 0 4px 12px rgba(30, 144, 255, 0.2);
     }
     
-    /* Dark theme text adjustments */
+    /* Label and Text Styling */
     label {
-        color: var(--text-primary) !important;
+        color: var(--text-color) !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
     }
     
     .markdown {
-        color: var(--text-primary) !important;
+        color: var(--text-color) !important;
+        line-height: 1.6;
     }
     
     .gr-form {
         background: var(--input-bg);
         border: 1px solid var(--border-color);
+        border-radius: 8px;
+    }
+    
+    /* Highlight Tags */
+    .highlight-tag {
+        background: var(--highlight-color);
+        color: white;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        font-weight: 600;
+        display: inline-block;
+        margin: 2px;
+    }
+    
+    /* Typography Enhancements */
+    h1, h2, h3 {
+        font-weight: 700;
+        color: var(--text-color);
+    }
+    
+    h1 { font-size: 28px; }
+    h2 { font-size: 22px; }
+    h3 { font-size: 18px; }
+    
+    p {
+        font-size: 14px;
+        font-weight: 400;
+        line-height: 1.6;
+        color: var(--text-color);
+    }
+    
+    /* Professional spacing */
+    .gr-group {
+        gap: 24px;
+    }
+    
+    .gr-row {
+        gap: 16px;
     }
     """
 
@@ -411,7 +552,7 @@ def main():
             )
             
             def clear_all():
-                return "", "Texas", "", None, ""
+                return "", "India", "", None, ""
             
             clear.click(
                 clear_all,
